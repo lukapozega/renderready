@@ -10,56 +10,20 @@ interface RouteHandlerEntry {
   handler: (route: FakeRoute) => unknown;
 }
 
-class FakeApiResponse {
-  disposed = false;
-  private readonly statusCode: number;
-  private readonly responseHeaders: Record<string, string>;
-
-  constructor(statusCode: number, responseHeaders: Record<string, string> = {}) {
-    this.statusCode = statusCode;
-    this.responseHeaders = responseHeaders;
-  }
-
-  status = () => this.statusCode;
-  headers = () => this.responseHeaders;
-  dispose = vi.fn(async () => {
-    this.disposed = true;
-  });
-}
-
 class FakeRoute {
-  fulfilled = false;
   aborted = false;
   continued = false;
-  fellBack = false;
-  fetchError: Error | undefined;
   private readonly requestUrl: string;
   private readonly resourceType: string;
-  private readonly fetchResponse: FakeApiResponse | undefined;
 
-  constructor(requestUrl: string, resourceType: string, fetchResponse?: FakeApiResponse) {
+  constructor(requestUrl: string, resourceType: string) {
     this.requestUrl = requestUrl;
     this.resourceType = resourceType;
-    this.fetchResponse = fetchResponse;
   }
 
   request = () => ({
     resourceType: () => this.resourceType,
     url: () => this.requestUrl,
-  });
-
-  fetch = vi.fn(async (): Promise<FakeApiResponse> => {
-    if (this.fetchError) {
-      throw this.fetchError;
-    }
-    if (!this.fetchResponse) {
-      throw new Error('no fetch response configured');
-    }
-    return this.fetchResponse;
-  });
-
-  fulfill = vi.fn(async () => {
-    this.fulfilled = true;
   });
 
   abort = vi.fn(async () => {
@@ -69,33 +33,124 @@ class FakeRoute {
   continue = vi.fn(async () => {
     this.continued = true;
   });
+}
 
-  fallback = vi.fn(() => {
-    this.fellBack = true;
-  });
+/** A response for the navigation to present at the response stage. */
+interface PausedResponse {
+  url: string;
+  status: number;
+  headers?: { name: string; value: string }[];
 }
 
 /**
- * A page whose `goto` drives the registered route handler, the way a real
+ * The CDP session redirect detection opens. `pause` plays Chromium's part: it
+ * emits `Fetch.requestPaused` and resolves once the listener has released the
+ * request, with whichever command released it.
+ */
+class FakeCDPSession {
+  readonly sent: { method: string; params: Record<string, unknown> }[] = [];
+  detached = false;
+  /** Make every command after `Fetch.enable` fail, as when the page has closed. */
+  releaseError: Error | undefined;
+  private listener: ((event: unknown) => void) | undefined;
+  private readonly releases = new Map<string, (method: string) => void>();
+  private nextRequestId = 1;
+
+  on = vi.fn((event: string, listener: (event: unknown) => void) => {
+    if (event === 'Fetch.requestPaused') {
+      this.listener = listener;
+    }
+    return this;
+  });
+
+  send = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+    this.sent.push({ method, params });
+    const release = this.releases.get(String(params.requestId));
+    if (method !== 'Fetch.enable' && this.releaseError) {
+      release?.('failed');
+      throw this.releaseError;
+    }
+    release?.(method);
+    return {};
+  });
+
+  detach = vi.fn(async () => {
+    this.detached = true;
+  });
+
+  get enabled(): boolean {
+    return this.sent.some(command => command.method === 'Fetch.enable');
+  }
+
+  pause(response: PausedResponse): Promise<string> {
+    const requestId = String(this.nextRequestId++);
+    const released = new Promise<string>(resolve => this.releases.set(requestId, resolve));
+    this.listener?.({
+      requestId,
+      request: { url: response.url },
+      responseStatusCode: response.status,
+      responseHeaders: response.headers ?? [],
+    });
+    return released;
+  }
+
+  sentMethods(): string[] {
+    return this.sent.map(command => command.method);
+  }
+}
+
+/**
+ * A page whose `goto` presents its responses to the CDP session, the way a real
  * navigation would. That is what lets these tests exercise redirect detection
  * without a browser.
  */
 class FakePage {
   readonly routes: RouteHandlerEntry[] = [];
   readonly viewports: { width: number; height: number }[] = [];
+  readonly session = new FakeCDPSession();
+  cdpError: Error | undefined;
   gotoStatus = 200;
   gotoHeaders: Record<string, string> = { 'content-type': 'text/html' };
   gotoError: Error | undefined;
   gotoReturnsNull = false;
   contentError: Error | undefined;
   htmlContent = '<html><body>rendered</body></html>';
-  /** The route the navigation should present to the handler, if any. */
-  navigationRoute: FakeRoute | undefined;
+  /** Document responses the navigation pauses on, in order, if interception is enabled. */
+  pausedResponses: PausedResponse[] = [];
 
   url = vi.fn(() => 'https://example.test/');
   setViewportSize = vi.fn(async (viewport: { width: number; height: number }) => {
     this.viewports.push(viewport);
   });
+
+  newCDPSession = vi.fn(async () => {
+    if (this.cdpError) {
+      throw this.cdpError;
+    }
+    return this.session;
+  });
+
+  context = () => ({ newCDPSession: this.newCDPSession });
+
+  /** How the origin answers a probe from Node; unset makes the probe fail. */
+  probeResponse: { status: number; headers: Record<string, string> } | undefined;
+  probeDisposed = false;
+
+  request = {
+    fetch: vi.fn(async () => {
+      const answer = this.probeResponse;
+      if (!answer) {
+        throw new Error('connect ECONNREFUSED');
+      }
+      return {
+        status: () => answer.status,
+        headers: () => answer.headers,
+        dispose: async () => {
+          this.probeDisposed = true;
+        },
+      };
+    }),
+  };
 
   route = vi.fn(
     async (matcher: RouteHandlerEntry['matcher'], handler: RouteHandlerEntry['handler']) => {
@@ -104,14 +159,12 @@ class FakePage {
   );
 
   goto = vi.fn(async () => {
-    // Route handlers registered last run first, matching Playwright.
-    if (this.navigationRoute) {
-      for (const entry of [...this.routes].reverse()) {
-        await entry.handler(this.navigationRoute);
-        if (!this.navigationRoute.fellBack) {
-          break;
+    if (this.session.enabled) {
+      for (const response of this.pausedResponses) {
+        // A failed request is an aborted navigation, as Chromium reports it.
+        if ((await this.session.pause(response)) === 'Fetch.failRequest') {
+          throw new Error('net::ERR_ABORTED');
         }
-        this.navigationRoute.fellBack = false;
       }
     }
     if (this.gotoError) {
@@ -265,109 +318,196 @@ describe('renderPage', () => {
   describe('redirect detection', () => {
     it('returns the 3xx without loading the destination', async () => {
       const page = new FakePage();
-      const apiResponse = new FakeApiResponse(302, { location: 'https://example.test/new' });
-      page.navigationRoute = new FakeRoute('https://example.test/', 'document', apiResponse);
-      page.gotoError = new Error('net::ERR_ABORTED');
+      page.pausedResponses = [
+        {
+          url: 'https://example.test/',
+          status: 302,
+          headers: [{ name: 'Location', value: 'https://example.test/new' }],
+        },
+      ];
 
       const result = await renderPage(asPage(page), options());
 
       expect(result).toMatchObject({ status: 302, isRedirect: true, html: '' });
       expect(result.headers.location).toBe('https://example.test/new');
-      expect(page.navigationRoute.aborted).toBe(true);
-      expect(page.navigationRoute.fulfilled).toBe(false);
+      expect(page.session.sentMethods()).toContain('Fetch.failRequest');
+      expect(page.session.sentMethods()).not.toContain('Fetch.continueRequest');
+      expect(page.request.fetch).not.toHaveBeenCalled();
     });
 
-    it('re-fetches the document with redirects disabled', async () => {
+    describe('a redirect Chromium made itself', () => {
+      const hstsUpgrade: PausedResponse = {
+        url: 'http://example.test/',
+        status: 307,
+        headers: [
+          { name: 'Location', value: 'https://example.test/' },
+          { name: 'Non-Authoritative-Reason', value: 'HSTS' },
+        ],
+      };
+
+      it("reports the origin's own redirect instead", async () => {
+        const page = new FakePage();
+        page.pausedResponses = [hstsUpgrade];
+        page.probeResponse = { status: 301, headers: { location: 'https://example.test/' } };
+
+        const result = await renderPage(asPage(page), options({ url: 'http://example.test/' }));
+
+        expect(result).toMatchObject({ status: 301, isRedirect: true, html: '' });
+        expect(result.headers).toEqual({ location: 'https://example.test/' });
+        expect(page.request.fetch).toHaveBeenCalledWith(
+          'http://example.test/',
+          expect.objectContaining({ maxRedirects: 0 }),
+        );
+        expect(page.probeDisposed).toBe(true);
+      });
+
+      it('is followed when the origin itself does not redirect', async () => {
+        const page = new FakePage();
+        page.pausedResponses = [hstsUpgrade];
+        page.probeResponse = { status: 200, headers: {} };
+
+        const result = await renderPage(asPage(page), options({ url: 'http://example.test/' }));
+
+        expect(page.session.sentMethods()).toContain('Fetch.continueRequest');
+        expect(result.isRedirect).toBe(false);
+        expect(page.probeDisposed).toBe(true);
+      });
+
+      it('is followed when the origin cannot be asked', async () => {
+        const page = new FakePage();
+        page.pausedResponses = [hstsUpgrade];
+
+        const result = await renderPage(asPage(page), options({ url: 'http://example.test/' }));
+
+        expect(page.session.sentMethods()).toContain('Fetch.continueRequest');
+        expect(result.isRedirect).toBe(false);
+      });
+    });
+
+    it('pauses document requests once their response headers arrive', async () => {
       const page = new FakePage();
-      const apiResponse = new FakeApiResponse(301, { location: '/moved' });
-      page.navigationRoute = new FakeRoute('https://example.test/', 'document', apiResponse);
-      page.gotoError = new Error('net::ERR_ABORTED');
 
       await renderPage(asPage(page), options());
 
-      expect(page.navigationRoute.fetch).toHaveBeenCalledWith({ maxRedirects: 0 });
+      expect(page.session.sent[0]).toEqual({
+        method: 'Fetch.enable',
+        params: {
+          patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Response' }],
+        },
+      });
     });
 
-    it('fulfills the navigation from its own fetch on a non-redirect', async () => {
+    // The browser has to receive the document from the network. A document
+    // fulfilled from outside it counts as public to Chromium, whose local network
+    // access checks then block the page's requests to a private-address origin.
+    it('lets a non-redirect response through instead of replacing it', async () => {
       const page = new FakePage();
-      const apiResponse = new FakeApiResponse(200, { 'content-type': 'text/html' });
-      page.navigationRoute = new FakeRoute('https://example.test/', 'document', apiResponse);
+      page.pausedResponses = [{ url: 'https://example.test/', status: 200 }];
 
       const result = await renderPage(asPage(page), options());
 
-      expect(page.navigationRoute.fulfilled).toBe(true);
-      expect(result.isRedirect).toBe(false);
+      expect(page.session.sentMethods()).toEqual(['Fetch.enable', 'Fetch.continueRequest']);
+      expect(page.route).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ status: 200, isRedirect: false });
       expect(result.html).toBe('<html><body>rendered</body></html>');
     });
 
-    // Not disposing retains the response body for the life of the context, which
-    // leaks steadily under load. This was a real production fix.
-    it('always disposes the intercepted response', async () => {
-      const redirectResponse = new FakeApiResponse(302, {});
-      const redirectPage = new FakePage();
-      redirectPage.navigationRoute = new FakeRoute(
-        'https://example.test/',
-        'document',
-        redirectResponse,
-      );
-      redirectPage.gotoError = new Error('net::ERR_ABORTED');
-      await renderPage(asPage(redirectPage), options());
-      expect(redirectResponse.disposed).toBe(true);
-
-      const okResponse = new FakeApiResponse(200, {});
-      const okPage = new FakePage();
-      okPage.navigationRoute = new FakeRoute('https://example.test/', 'document', okResponse);
-      await renderPage(asPage(okPage), options());
-      expect(okResponse.disposed).toBe(true);
-    });
-
-    it('falls back to a normal navigation when the probe fetch fails', async () => {
+    it('reports header names lowercased, with repeated headers joined', async () => {
       const page = new FakePage();
-      const route = new FakeRoute('https://example.test/', 'document');
-      route.fetchError = new Error('connection reset');
-      page.navigationRoute = route;
+      page.pausedResponses = [
+        {
+          url: 'https://example.test/',
+          status: 301,
+          headers: [
+            { name: 'Location', value: '/moved' },
+            { name: 'Link', value: '</a>; rel=preload' },
+            { name: 'link', value: '</b>; rel=preload' },
+          ],
+        },
+      ];
 
       const result = await renderPage(asPage(page), options());
 
-      expect(route.continued).toBe(true);
-      expect(result.isRedirect).toBe(false);
-      expect(result.status).toBe(200);
+      expect(result.headers).toEqual({
+        location: '/moved',
+        link: '</a>; rel=preload, </b>; rel=preload',
+      });
     });
 
-    it('leaves a non-document request at the same URL to the handler underneath', async () => {
+    it('releases a redirect on any other document, such as an iframe', async () => {
       const page = new FakePage();
-      const route = new FakeRoute('https://example.test/', 'xhr');
-      page.navigationRoute = route;
+      page.pausedResponses = [
+        { url: 'https://example.test/', status: 200 },
+        { url: 'https://ads.example.test/frame', status: 302 },
+      ];
+
+      const result = await renderPage(asPage(page), options());
+
+      expect(page.session.sentMethods()).not.toContain('Fetch.failRequest');
+      expect(result.isRedirect).toBe(false);
+    });
+
+    it('matches the requested URL regardless of its fragment', async () => {
+      const page = new FakePage();
+      page.pausedResponses = [{ url: 'https://example.test/', status: 302 }];
+
+      const result = await renderPage(
+        asPage(page),
+        options({ url: 'https://example.test/#section' }),
+      );
+
+      expect(result.isRedirect).toBe(true);
+    });
+
+    it('detaches the session once the render is done', async () => {
+      const page = new FakePage();
 
       await renderPage(asPage(page), options());
 
-      expect(route.fetch).not.toHaveBeenCalled();
+      expect(page.session.detached).toBe(true);
     });
 
-    it('installs no interceptor at all when following redirects', async () => {
+    it('detaches the session when navigation fails too', async () => {
       const page = new FakePage();
-      const route = new FakeRoute(
-        'https://example.test/',
-        'document',
-        new FakeApiResponse(302, {}),
-      );
-      page.navigationRoute = route;
+      page.gotoError = new Error('net::ERR_CONNECTION_REFUSED');
+
+      await expect(renderPage(asPage(page), options())).rejects.toThrow(RenderError);
+      expect(page.session.detached).toBe(true);
+    });
+
+    it('navigates normally when interception is unavailable', async () => {
+      const page = new FakePage();
+      page.cdpError = new Error('CDP session is only available in Chromium');
+
+      const result = await renderPage(asPage(page), options());
+
+      expect(result).toMatchObject({ status: 200, isRedirect: false });
+    });
+
+    it('still finishes the render when a paused request cannot be released', async () => {
+      const page = new FakePage();
+      page.pausedResponses = [{ url: 'https://example.test/', status: 200 }];
+      page.session.releaseError = new Error('Target page, context or browser has been closed');
+
+      const result = await renderPage(asPage(page), options());
+
+      expect(result.isRedirect).toBe(false);
+    });
+
+    it('opens no session at all when following redirects', async () => {
+      const page = new FakePage();
+      page.pausedResponses = [{ url: 'https://example.test/', status: 302 }];
 
       const result = await renderPage(asPage(page), options({ followRedirects: true }));
 
+      expect(page.newCDPSession).not.toHaveBeenCalled();
       expect(page.routes).toHaveLength(0);
-      expect(route.fetch).not.toHaveBeenCalled();
       expect(result.isRedirect).toBe(false);
     });
 
     it('propagates a genuine navigation failure rather than reporting a redirect', async () => {
       const page = new FakePage();
-      const route = new FakeRoute(
-        'https://example.test/',
-        'document',
-        new FakeApiResponse(200, {}),
-      );
-      page.navigationRoute = route;
+      page.pausedResponses = [{ url: 'https://example.test/', status: 200 }];
       page.gotoError = new Error('net::ERR_CONNECTION_REFUSED');
 
       await expect(renderPage(asPage(page), options())).rejects.toThrow(RenderError);
@@ -383,16 +523,14 @@ describe('renderPage', () => {
       expect(page.routes).toHaveLength(0);
     });
 
-    it('registers the blocklist beneath the redirect interceptor', async () => {
+    it('blocks through a single route, leaving redirect detection to the CDP session', async () => {
       const page = new FakePage();
 
       await renderPage(asPage(page), options({ blockedResourceTypes: ['image'] }));
 
-      // Order matters: Playwright runs the last-registered handler first, so the
-      // document interceptor must be registered after the blocklist.
-      expect(page.routes).toHaveLength(2);
+      expect(page.routes).toHaveLength(1);
       expect(page.routes[0]?.matcher).toBe('**/*');
-      expect(typeof page.routes[1]?.matcher).toBe('function');
+      expect(page.session.enabled).toBe(true);
     });
 
     it('aborts a blocked resource type and allows everything else', async () => {

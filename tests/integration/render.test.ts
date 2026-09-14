@@ -1,3 +1,5 @@
+import { networkInterfaces } from 'node:os';
+
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { noopLogger } from '../../src/logger.js';
@@ -109,6 +111,81 @@ describe('redirects', () => {
     expect(result.isRedirect).toBe(false);
     expect(result.html).toContain('content from javascript');
     expect(origin.requests).toContain('/ready');
+  });
+
+  // Resource blocking intercepts every request through Playwright, on top of
+  // the document interception redirect detection does.
+  it('still reports a redirect while resource blocking is intercepting too', async () => {
+    const blocking = createRenderer({
+      logger: noopLogger,
+      blockedResourceTypes: ['image'],
+      pageDoneCheckInterval: 50,
+      waitAfterLastRequest: 100,
+    });
+    await blocking.start();
+    try {
+      const redirect = await blocking.render(`${origin.url}/redirect`);
+      expect(redirect.statusCode).toBe(302);
+      expect(origin.requests).not.toContain('/ready');
+
+      const rendered = await blocking.render(`${origin.url}/external-script`);
+      expect(rendered.html).toContain('content from an external script');
+    } finally {
+      await blocking.stop();
+    }
+  }, 60_000);
+});
+
+/**
+ * The first IPv4 address of this machine in a private range, if it has one.
+ * GitHub's hosted runners do.
+ */
+function privateNetworkAddress(): string | undefined {
+  const isPrivate = (address: string): boolean =>
+    /^10\./.test(address) ||
+    /^192\.168\./.test(address) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(address);
+
+  return Object.values(networkInterfaces())
+    .flat()
+    .find(entry => entry?.family === 'IPv4' && !entry.internal && isPrivate(entry.address))
+    ?.address;
+}
+
+const privateAddress = privateNetworkAddress();
+
+// Where a renderer usually meets its origin: a Docker service name, a Kubernetes
+// service or an internal load balancer, all private addresses over plain http.
+// Chromium applies its local network access checks there and not to loopback,
+// which is why the fixture above cannot show this.
+describe.skipIf(privateAddress === undefined)('an origin on a private network address', () => {
+  let privateOrigin: FixtureServer;
+
+  beforeAll(async () => {
+    privateOrigin = await startFixtureServer(privateAddress);
+  });
+
+  afterAll(async () => {
+    await privateOrigin?.close();
+  });
+
+  beforeEach(() => {
+    privateOrigin.reset();
+  });
+
+  it('renders content from a script the page loads from its own origin', async () => {
+    const result = await renderer.render(`${privateOrigin.url}/external-script`);
+
+    expect(result.html).toContain('content from an external script');
+    expect(privateOrigin.requests).toContain('/app.js');
+  });
+
+  it('reports a 302 without fetching the destination', async () => {
+    const result = await renderer.render(`${privateOrigin.url}/redirect`);
+
+    expect(result.statusCode).toBe(302);
+    expect(result.headers.location).toBe('/ready');
+    expect(privateOrigin.requests).toEqual(['/redirect']);
   });
 });
 

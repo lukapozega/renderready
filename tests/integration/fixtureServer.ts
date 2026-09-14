@@ -54,6 +54,17 @@ const NO_FLAG_PAGE = page(
    </script>`,
 );
 
+/**
+ * Content comes from a script the page loads from its own origin. Unlike an
+ * inline script, that is a request the document makes, so it only renders if
+ * the browser lets the document reach its own origin.
+ */
+const EXTERNAL_SCRIPT_PAGE = page(
+  '<title>External script</title>',
+  `<div id="app">loading</div>
+   <script src="/app.js"></script>`,
+);
+
 /** Content arrives via fetch, so the quiet window is what decides. */
 const XHR_PAGE = page(
   '<title>Xhr</title>',
@@ -102,7 +113,12 @@ const COOKIE_PAGE = page(
 const HEADER_ECHO_PAGE = (headerValue: string): string =>
   page('<title>Headers</title>', `<div id="app">x-renderready:${headerValue}</div>`);
 
-export async function startFixtureServer(): Promise<FixtureServer> {
+/**
+ * @param host Address to listen on, and the host in the returned `url`. Loopback
+ * by default; a private network address puts the origin where Chromium's local
+ * network access checks apply, which they do not to loopback.
+ */
+export async function startFixtureServer(host = '127.0.0.1'): Promise<FixtureServer> {
   const requests: string[] = [];
 
   const server: Server = createServer((request, response) => {
@@ -123,6 +139,8 @@ export async function startFixtureServer(): Promise<FixtureServer> {
         return html(NO_FLAG_PAGE);
       case '/xhr':
         return html(XHR_PAGE);
+      case '/external-script':
+        return html(EXTERNAL_SCRIPT_PAGE);
       case '/ld-json':
         return html(LD_JSON_PAGE);
       case '/relative':
@@ -162,6 +180,12 @@ export async function startFixtureServer(): Promise<FixtureServer> {
         });
         return response.end(page('<title>Header</title>', 'ok'));
 
+      case '/app.js':
+        response.writeHead(200, { 'content-type': 'text/javascript' });
+        return response.end(
+          "document.getElementById('app').textContent = 'content from an external script';",
+        );
+
       case '/styles.css':
         response.writeHead(200, { 'content-type': 'text/css' });
         return response.end('body{color:red}');
@@ -175,13 +199,13 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   });
 
   await new Promise<void>(resolve => {
-    server.listen(0, '127.0.0.1', resolve);
+    server.listen(0, host, resolve);
   });
 
   const { port } = server.address() as AddressInfo;
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://${host}:${port}`,
     requests,
     reset: () => {
       requests.length = 0;
