@@ -87,7 +87,7 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
-    "@changesets/cli": "^2.31.1",
+    "@changesets/cli": "^3.0.1",
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^5.0.0",
