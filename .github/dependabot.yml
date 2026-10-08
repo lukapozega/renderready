@@ -28,6 +28,15 @@ updates:
         update-types:
           - minor
           - patch
+      # Majors get their own group rather than none: vitest and @vitest/* pin
+      # each other as exact peers, so a major split into one PR per package
+      # can never pass `npm ci`.
+      test-tooling-major:
+        patterns:
+          - 'vitest'
+          - '@vitest/*'
+        update-types:
+          - major
       build-tooling:
         patterns:
           - 'tsup'
@@ -62,3 +71,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    ignore:
+      # The `mcr.microsoft.com/playwright` image, which Dependabot names by its
+      # repository alone. Bumped by hand with playwright-core, as above: an
+      # image bump on its own ships a browser build that playwright-core will
+      # not launch.
+      - dependency-name: 'playwright'
