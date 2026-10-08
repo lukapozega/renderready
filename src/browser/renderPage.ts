@@ -1,4 +1,4 @@
-import type { Page, Route } from 'playwright-core';
+import type { CDPSession, Page, Route } from 'playwright-core';
 
 import type { ResourceType } from '../config.js';
 import { RenderError, errorMessage } from '../errors.js';
@@ -47,15 +47,13 @@ export async function renderPage(
 
   await page.setViewportSize(options.viewport);
 
-  // Registered first so it sits *underneath* the document interceptor below:
-  // Playwright runs the most recently registered matching handler first.
   await installResourceBlocking(page, options);
 
-  // Populated by the interceptor during navigation when the requested URL
-  // answers with a 3xx. Absent entirely when following redirects is enabled.
+  // Populated during navigation when the requested URL answers with a 3xx.
+  // Absent entirely when following redirects is enabled.
   const redirect = options.followRedirects
     ? undefined
-    : await installRedirectDetection(page, url, logger);
+    : await installRedirectDetection(page, url, remaining, logger);
 
   const asRedirectResult = (): RenderPageResult | undefined =>
     redirect?.status === undefined
@@ -126,12 +124,24 @@ export async function renderPage(
     };
   } finally {
     tracker.stop();
+    await redirect?.detach();
   }
 }
 
 interface RedirectCapture {
   status: number | undefined;
   headers: Record<string, string>;
+  /** Stop intercepting. Never throws, including after the page has closed. */
+  detach: () => Promise<void>;
+}
+
+/** The parts of a CDP `Fetch.requestPaused` event redirect detection reads. */
+interface PausedRequest {
+  requestId: string;
+  request: { url: string };
+  /** Present when paused at the response stage, which is the only stage enabled. */
+  responseStatusCode?: number;
+  responseHeaders?: { name: string; value: string }[];
 }
 
 /**
@@ -139,60 +149,171 @@ interface RedirectCapture {
  *
  * Crawlers need to see the 3xx so they can update their index, so the default is
  * not to follow — but Playwright's `goto()` always does. The workaround is to
- * intercept the top-level document request and re-fetch it with `maxRedirects: 0`.
- * On a 3xx we record it and abort, so the destination is never fetched or
- * rendered; otherwise we fulfill the navigation from the response we already
- * have, avoiding a second request to the origin.
+ * pause the top-level document request through the Chrome DevTools Protocol once
+ * its response headers arrive. On a 3xx we record it and fail the request, so the
+ * destination is never fetched or rendered; otherwise the browser carries on
+ * with the response it is already receiving.
  *
- * Scoped to the exact requested URL, so subresources are untouched.
+ * Letting that response through matters. Fetching the document from Node and
+ * fulfilling the navigation with it looks equivalent, but a fulfilled document
+ * has no remote address, so Chromium places it in the public address space. Its
+ * local network access checks then block every request the page makes to an
+ * origin on a private address — a Docker service name, say — and the page never
+ * loads its own scripts.
+ *
+ * Not every redirect that pauses came from the origin. Chromium makes some up
+ * without sending the request — an HSTS upgrade of `http://` to `https://` is a
+ * `307 Internal Redirect` — and those are asked of the origin from Node instead,
+ * so the caller hears what a crawler would. That probe is only read, never handed
+ * to the page, so it cannot trip the checks above.
+ *
+ * Scoped to document requests for the exact requested URL; any other document
+ * that pauses is released untouched.
  */
 async function installRedirectDetection(
   page: Page,
   url: string,
+  remaining: () => number,
   logger: Logger,
 ): Promise<RedirectCapture> {
-  const capture: RedirectCapture = { status: undefined, headers: {} };
-  const normalized = new URL(url).href;
+  const capture: RedirectCapture = {
+    status: undefined,
+    headers: {},
+    detach: async () => {},
+  };
+  // Compared without the fragment, which CDP never includes in a request URL.
+  const target = withoutFragment(url);
 
-  await page.route(
-    requestUrl => requestUrl.href === normalized,
-    async (route: Route) => {
-      if (route.request().resourceType() !== 'document') {
-        // Same URL but not the navigation itself; let the blocking handler
-        // registered underneath decide.
-        return route.fallback();
+  let session: CDPSession | undefined;
+  try {
+    session = await page.context().newCDPSession(page);
+    const cdp = session;
+
+    const originRedirect = async (event: PausedRequest): Promise<RedirectResponse | undefined> => {
+      const status = event.responseStatusCode;
+      if (
+        status === undefined ||
+        !isRedirectStatus(status) ||
+        withoutFragment(event.request.url) !== target
+      ) {
+        return undefined;
       }
+      const headers = headerRecord(event.responseHeaders ?? []);
+      if (headers[INTERNAL_REDIRECT_HEADER] === undefined) {
+        return { status, headers };
+      }
+      const answer = await probeOrigin(page, url, remaining(), logger);
+      return answer !== undefined && isRedirectStatus(answer.status) ? answer : undefined;
+    };
 
-      let documentResponse;
+    const release = async (event: PausedRequest): Promise<void> => {
       try {
-        documentResponse = await route.fetch({ maxRedirects: 0 });
+        const redirect = await originRedirect(event);
+        if (redirect) {
+          capture.status = redirect.status;
+          capture.headers = redirect.headers;
+          await cdp.send('Fetch.failRequest', {
+            requestId: event.requestId,
+            errorReason: 'Aborted',
+          });
+          return;
+        }
+        await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
       } catch (error) {
-        // Could not fetch it ourselves; fall back to an ordinary navigation and
-        // accept that a redirect will be followed.
-        logger.debug('Redirect probe failed; navigating normally', {
+        // The page closed while the request was paused, which ends the render anyway.
+        logger.debug('Could not release a paused document request', {
           url,
           error: errorMessage(error),
         });
-        return route.continue();
       }
+    };
 
-      try {
-        if (isRedirectStatus(documentResponse.status())) {
-          capture.status = documentResponse.status();
-          capture.headers = documentResponse.headers();
-          await route.abort();
-          return;
-        }
-        await route.fulfill({ response: documentResponse });
-      } finally {
-        // Not optional: without this the response body is retained for the life
-        // of the context, which leaks steadily under load.
-        await documentResponse.dispose().catch(() => {});
-      }
-    },
-  );
+    cdp.on('Fetch.requestPaused', event => void release(event));
+    await cdp.send('Fetch.enable', {
+      patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Response' }],
+    });
+    capture.detach = () => cdp.detach().catch(() => {});
+  } catch (error) {
+    // Without interception the navigation is ordinary, and a redirect is followed.
+    logger.debug('Redirect detection unavailable; navigating normally', {
+      url,
+      error: errorMessage(error),
+    });
+    await session?.detach().catch(() => {});
+  }
 
   return capture;
+}
+
+interface RedirectResponse {
+  status: number;
+  headers: Record<string, string>;
+}
+
+/** Chromium sets this on a redirect it made itself rather than received. */
+const INTERNAL_REDIRECT_HEADER = 'non-authoritative-reason';
+
+/**
+ * How the origin itself answers `url`, without following a redirect.
+ *
+ * @returns `undefined` when the origin could not be asked, in which case the
+ * browser's own redirect is followed, as a navigation without detection would.
+ */
+async function probeOrigin(
+  page: Page,
+  url: string,
+  timeoutMs: number,
+  logger: Logger,
+): Promise<RedirectResponse | undefined> {
+  let response;
+  try {
+    // A timeout of 0 means none at all to Playwright, so a spent budget still gets one.
+    response = await page.request.fetch(url, { maxRedirects: 0, timeout: Math.max(1, timeoutMs) });
+  } catch (error) {
+    logger.debug('Origin probe failed; following the browser redirect', {
+      url,
+      error: errorMessage(error),
+    });
+    return undefined;
+  }
+  try {
+    return { status: response.status(), headers: response.headers() };
+  } finally {
+    // Not optional: without this the response body is retained for the life of
+    // the context, which leaks steadily under load.
+    await response.dispose().catch(() => {});
+  }
+}
+
+/**
+ * Never throws: a paused request whose URL cannot be parsed must still be
+ * released, or its navigation hangs until the render times out.
+ */
+function withoutFragment(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * CDP header entries as a record. Names are lowercased, as Playwright reports
+ * them, and repeated headers are joined into one comma-separated value. As in
+ * Playwright, set-cookie is joined with newlines instead, because a cookie's
+ * Expires date contains a comma.
+ */
+function headerRecord(entries: { name: string; value: string }[]): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const { name, value } of entries) {
+    const key = name.toLowerCase();
+    const existing = headers[key];
+    const separator = key === 'set-cookie' ? '\n' : ', ';
+    headers[key] = existing === undefined ? value : `${existing}${separator}${value}`;
+  }
+  return headers;
 }
 
 /**

@@ -31,35 +31,45 @@ let lastViewport: { width: number; height: number } | undefined;
 
 function makeFakeBrowser() {
   const makePage = () => {
-    const handlers: ((route: unknown) => unknown)[] = [];
+    let onPaused: ((event: unknown) => void) | undefined;
+    let released: (() => void) | undefined;
+
+    const session = {
+      on: vi.fn((_event: string, listener: (event: unknown) => void) => {
+        onPaused = listener;
+      }),
+      send: vi.fn(async (method: string) => {
+        if (method === 'Fetch.failRequest' || method === 'Fetch.continueRequest') {
+          released?.();
+        }
+        return {};
+      }),
+      detach: vi.fn(async () => {}),
+    };
 
     return {
       setViewportSize: vi.fn(async (viewport: { width: number; height: number }) => {
         lastViewport = viewport;
       }),
-      route: vi.fn(async (_matcher: unknown, handler: (route: unknown) => unknown) => {
-        handlers.push(handler);
-      }),
+      route: vi.fn(async () => {}),
+      context: () => ({ newCDPSession: vi.fn(async () => session) }),
       goto: vi.fn(async () => {
-        // Drive the document interceptor the way a real navigation would, so the
-        // redirect path is genuinely exercised rather than simulated.
-        if (script.redirect) {
-          const response = {
-            status: () => script.redirect?.status ?? 302,
-            headers: () => script.redirect?.headers ?? {},
-            dispose: vi.fn(async () => {}),
-          };
-          const route = {
-            request: () => ({ resourceType: () => 'document', url: () => 'https://example.test/' }),
-            fetch: vi.fn(async () => response),
-            abort: vi.fn(async () => {}),
-            fulfill: vi.fn(async () => {}),
-            continue: vi.fn(async () => {}),
-            fallback: vi.fn(),
-          };
-          for (const handler of [...handlers].reverse()) {
-            await handler(route);
-          }
+        // Pause the document on the session the way a real navigation would, so
+        // the redirect path is genuinely exercised rather than simulated.
+        if (script.redirect && onPaused) {
+          const release = new Promise<void>(resolve => {
+            released = resolve;
+          });
+          onPaused({
+            requestId: '1',
+            request: { url: 'https://example.test/' },
+            responseStatusCode: script.redirect.status,
+            responseHeaders: Object.entries(script.redirect.headers).map(([name, value]) => ({
+              name,
+              value,
+            })),
+          });
+          await release;
           throw new Error('net::ERR_ABORTED');
         }
         if (script.gotoError) {
