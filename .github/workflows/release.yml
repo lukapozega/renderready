@@ -37,18 +37,19 @@ jobs:
       # version may lag behind.
       - run: npm install --global npm@latest
 
+      # No NODE_AUTH_TOKEN and no NPM_TOKEN: publishing authenticates with
+      # the OIDC token from `id-token: write`. This requires a one-time
+      # setup on npmjs.com
+      #
+      # No GITHUB_TOKEN either: v2 ignores the env var and its `github-token`
+      # input already defaults to the workflow's token.
       - name: Create a release PR, or publish if one was merged
-        uses: changesets/action@v1
+        uses: changesets/action@v2
         with:
           # When changesets are pending, this opens or updates a PR that bumps
           # the version and writes the changelog. When that PR is merged and no
-          # changesets remain, `publish` runs instead.
-          version: npx changeset version
-          publish: npx changeset publish
-          commit: 'chore: release'
-          title: 'chore: release'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No NODE_AUTH_TOKEN and no NPM_TOKEN: publishing authenticates with
-          # the OIDC token from `id-token: write`. This requires a one-time
-          # setup on npmjs.com
+          # changesets remain, `publish-script` runs instead.
+          version-script: npx changeset version
+          publish-script: npx changeset publish
+          commit-message: 'chore: release'
+          pr-title: 'chore: release'
