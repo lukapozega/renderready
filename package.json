@@ -83,7 +83,7 @@
   },
   "dependencies": {
     "fastify": "^5.11.2",
-    "playwright-core": "^1.62.1"
+    "playwright-core": "^1.63.0"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
@@ -93,7 +93,7 @@
     "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^10.8.0",
     "eslint-config-prettier": "^10.1.8",
-    "playwright": "^1.62.1",
+    "playwright": "^1.63.0",
     "prettier": "^3.9.6",
     "publint": "^0.3.23",
     "tsup": "^8.5.1",
