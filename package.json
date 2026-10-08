@@ -1,6 +1,6 @@
 {
   "name": "renderready",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Prerender any JavaScript web page to static HTML. A modern, Playwright-powered prerender server you can start in one line.",
   "keywords": [
     "prerender",
