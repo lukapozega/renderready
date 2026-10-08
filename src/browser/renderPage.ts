@@ -301,14 +301,17 @@ function withoutFragment(url: string): string {
 
 /**
  * CDP header entries as a record. Names are lowercased, as Playwright reports
- * them, and repeated headers are joined into one comma-separated value.
+ * them, and repeated headers are joined into one comma-separated value. As in
+ * Playwright, set-cookie is joined with newlines instead, because a cookie's
+ * Expires date contains a comma.
  */
 function headerRecord(entries: { name: string; value: string }[]): Record<string, string> {
   const headers: Record<string, string> = {};
   for (const { name, value } of entries) {
     const key = name.toLowerCase();
     const existing = headers[key];
-    headers[key] = existing === undefined ? value : `${existing}, ${value}`;
+    const separator = key === 'set-cookie' ? '\n' : ', ';
+    headers[key] = existing === undefined ? value : `${existing}${separator}${value}`;
   }
   return headers;
 }

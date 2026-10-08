@@ -422,15 +422,19 @@ describe('renderPage', () => {
             { name: 'Location', value: '/moved' },
             { name: 'Link', value: '</a>; rel=preload' },
             { name: 'link', value: '</b>; rel=preload' },
+            { name: 'Set-Cookie', value: 'a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT' },
+            { name: 'set-cookie', value: 'b=2' },
           ],
         },
       ];
 
       const result = await renderPage(asPage(page), options());
 
+      // Playwright joins set-cookie with newlines, since an Expires date has a comma.
       expect(result.headers).toEqual({
         location: '/moved',
         link: '</a>; rel=preload, </b>; rel=preload',
+        'set-cookie': 'a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT\nb=2',
       });
     });
 
