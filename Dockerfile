@@ -4,7 +4,7 @@
 #
 # Keep this tag's version in step with the playwright-core range in package.json:
 # the image ships the browser build that version expects.
-FROM mcr.microsoft.com/playwright:v1.62.1-noble AS build
+FROM mcr.microsoft.com/playwright:v1.63.0-noble AS build
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 
-FROM mcr.microsoft.com/playwright:v1.62.1-noble AS runtime
+FROM mcr.microsoft.com/playwright:v1.63.0-noble AS runtime
 
 # An init process is not optional here. Every browser recycle kills Chromium, and
 # its child processes (renderer, GPU, zygote, crashpad) reparent to PID 1. Node
